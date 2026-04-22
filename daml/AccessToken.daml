@@ -1,0 +1,76 @@
+-- | This module defines the AccessToken template, which represents a consumer's
+-- licensed right to access a specific dataset from a provider. It is the on-ledger
+-- evidence of a completed data licensing transaction.
+module DataMarketplace.AccessToken where
+
+import DA.Time (Time)
+import DataMarketplace.DataListing (DataListing)
+
+-- | Represents a granted license for a consumer to access a specific dataset.
+-- This token is created after a successful licensing agreement and payment.
+-- It serves as the on-ledger proof of right-to-access for the consumer.
+-- Data providers can query for these tokens to verify access requests from consumers.
+template AccessToken
+  with
+    provider     : Party
+      -- ^ The party providing the data and issuing the token.
+    consumer     : Party
+      -- ^ The party who has licensed the data and holds the token.
+    operator     : Party
+      -- ^ The operator of the marketplace, who observes the token issuance.
+    listingCid   : ContractId DataListing
+      -- ^ The contract ID of the original data listing this token pertains to.
+    listingId    : Text
+      -- ^ A unique identifier for the data listing, for easy reference.
+    datasetName  : Text
+      -- ^ The name of the dataset.
+    issuedAt     : Time
+      -- ^ The timestamp when the token was issued.
+    expiresAt    : Optional Time
+      -- ^ The timestamp when the access rights expire. If None, the license is perpetual.
+    usageRights  : Text
+      -- ^ A description of the permitted usage of the data (e.g., "Internal analytics only").
+
+  where
+    signatory provider
+    observer consumer, operator
+
+    key (provider, consumer, listingId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Allows the consumer or provider to verify the token is not expired (if an expiry is set).
+    -- This is a non-consuming choice and will fail if the token has expired.
+    nonconsuming choice CheckStatus : ()
+      controller consumer, provider
+      do
+        -- If an expiry time is set, check that the current ledger time is before it.
+        case expiresAt of
+          Some expiry -> do
+            now <- getTime
+            assertMsg ("Access token for listing '" <> listingId <> "' expired at " <> show expiry) (now < expiry)
+          None ->
+            -- No expiry, so the token is considered perpetually valid.
+            return ()
+
+    -- | Allows the provider to revoke the access token, for example, due to a
+    -- breach of the terms of service. This archives the token, effectively
+    -- terminating the consumer's access rights.
+    choice Revoke : ()
+      with
+        reason: Text
+          -- ^ The reason for revoking the access token, for audit purposes.
+      controller provider
+      do
+        -- The act of exercising this consuming choice archives the contract.
+        -- Future logic could involve creating a 'RevocationReceipt' contract.
+        return ()
+
+    -- | Allows the consumer to voluntarily surrender their access rights before expiry.
+    -- This might be used if they no longer need the data or are decommissioning
+    -- a project that used it.
+    choice Surrender : ()
+      controller consumer
+      do
+        -- The act of exercising this consuming choice archives the contract.
+        -- Future logic could involve creating a 'SurrenderReceipt' contract.
+        return ()

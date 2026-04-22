@@ -1,0 +1,159 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module UsageAgreement where
+
+import Daml.Script
+
+import DA.Date (Date, toDateUTC)
+import DA.Time (Time, addRelTime, days, minutes, time)
+import DA.Assert ((assert, assertMsg))
+
+import DataListing (DataListing)
+import qualified DataListing
+import AccessToken (AccessToken)
+import qualified AccessToken
+
+-- | Represents a legally binding agreement between a data provider and a consumer
+-- | for the use of a specific dataset. This contract is created off-ledger or through
+-- | a choice on a `DataListingProposal`, signifying a successful licensing transaction.
+-- | It governs the terms of use and serves as the authorization for issuing an
+-- | `AccessToken`.
+template UsageAgreement
+  with
+    provider       : Party
+      -- ^ The party licensing the data.
+    consumer       : Party
+      -- ^ The party receiving the license to use the data.
+    listingCid     : ContractId DataListing
+      -- ^ The contract ID of the original `DataListing` this agreement pertains to.
+    listingDetails : DataListing
+      -- ^ A snapshot of the data listing at the time of agreement. This prevents
+      -- ^ issues if the original listing is modified or archived.
+    agreementId    : Text
+      -- ^ A unique identifier for this specific agreement.
+    agreementTime  : Time
+      -- ^ The timestamp when the agreement was finalized.
+    expiryDate     : Date
+      -- ^ The date on which the rights granted by this agreement expire.
+    price          : Decimal
+      -- ^ The price paid by the consumer for this data license.
+    terms          : Text
+      -- ^ The specific usage terms and conditions agreed upon by both parties.
+    hasIssuedToken : Bool
+      -- ^ A flag to ensure that an `AccessToken` is issued at most once per agreement.
+  where
+    signatory provider, consumer
+
+    -- The key ensures that for a given provider, consumer, and data listing, each
+    -- agreement has a unique ID.
+    key (provider, consumer, listingDetails.listingId, agreementId) : (Party, Party, Text, Text)
+    maintainer key._1, key._2
+
+    ensure
+      expiryDate >= toDateUTC agreementTime &&
+      price >= 0.0
+
+    -- | Allows the `consumer` to issue themselves an `AccessToken` based on the
+    -- | terms of this agreement. This choice can only be exercised once and before
+    -- | the agreement expires.
+    choice IssueAccessToken : ContractId AccessToken
+      controller consumer
+      do
+        -- Enforce that a token can only be issued once for this agreement.
+        assertMsg "Access token has already been issued for this agreement."
+          (not hasIssuedToken)
+
+        -- Check that the agreement is still valid at the time of token issuance.
+        now <- getTime
+        assertMsg ("Usage agreement expired on " <> show expiryDate <> " and cannot be used to issue a new token.")
+          (toDateUTC now <= expiryDate)
+
+        -- Create the access token, which grants the technical right to access the data.
+        accessTokenCid <- create AccessToken with
+          provider = provider
+          consumer = consumer
+          listingId = listingDetails.listingId
+          issuedTime = now
+          expiryDate = expiryDate
+
+        -- Recreate the agreement with the flag updated to prevent re-issuance.
+        create this with hasIssuedToken = True
+
+        return accessTokenCid
+
+    -- | Allows either party to archive the agreement after it has expired. This helps
+    -- | to clean up the Active Contract Set (ACS).
+    choice ArchiveExpired : ()
+      controller provider, consumer
+      do
+        now <- getTime
+        assertMsg ("Agreement cannot be archived before its expiry date of " <> show expiryDate <> ".")
+          (toDateUTC now > expiryDate)
+        return ()
+
+-- | Test setup for the UsageAgreement template.
+test_UsageAgreement : Script ()
+test_UsageAgreement = script do
+  provider <- allocatePartyWithHint "DataProvider" (PartyIdHint "dataprovider")
+  consumer <- allocatePartyWithHint "DataConsumer" (PartyIdHint "dataconsumer")
+
+  let
+    now = time (DA.Date.date 2024 Feb 05) 10 00 00
+    listing = DataListing with
+      provider = provider
+      listingId = "financial-data-q1-2024"
+      description = "Quarterly financial performance data for public companies."
+      price = 1000.0
+      currency = "USD"
+      observers = []
+
+  listingCid <- submit provider do create listing
+
+  -- 1. Create a valid usage agreement
+  let
+    agreement = UsageAgreement with
+      provider = provider
+      consumer = consumer
+      listingCid = listingCid
+      listingDetails = listing
+      agreementId = "AGMT-12345"
+      agreementTime = now
+      expiryDate = DA.Date.date 2025 Feb 05
+      price = 1000.0
+      terms = "For internal analytics purposes only. No redistribution."
+      hasIssuedToken = False
+
+  agreementCid <- submitMulti [provider, consumer] [] do create agreement
+
+  -- 2. Consumer successfully issues an access token
+  (agreementCid', tokenCid) <- submit consumer do
+    -- We need to pass the time explicitly in Daml Script
+    setTime (addRelTime now (minutes 1))
+    exerciseAndGetCid @UsageAgreement agreementCid IssueAccessToken
+
+  Some agreement' <- queryContractId consumer agreementCid'
+  assert (agreement'.hasIssuedToken)
+
+  Some token <- queryContractId consumer tokenCid
+  assert (token.consumer == consumer && token.provider == provider)
+
+  -- 3. Attempting to issue a token again should fail
+  submitMustFail consumer do
+    exercise agreementCid' IssueAccessToken
+
+  -- 4. Attempting to archive before expiry should fail
+  submitMustFail provider do
+    exercise agreementCid' ArchiveExpired
+
+  -- 5. Set time past expiry and archive successfully
+  let expiryTime = time (DA.Date.date 2025 Feb 06) 10 00 00 -- One day after expiry
+  submit provider do
+    setTime expiryTime
+    exercise agreementCid' ArchiveExpired
+
+  -- Verify the agreement is archived
+  isActive <- queryContractId provider agreementCid'
+  assert (isActive == None)
+
+  return ()

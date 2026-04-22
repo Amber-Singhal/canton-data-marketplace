@@ -1,0 +1,51 @@
+module DataListing where
+
+-- | The `DataListing` template represents a dataset offered for license on the marketplace.
+-- It contains metadata about the data, including its schema, description, and price.
+-- The data itself is never stored on the ledger; only the rights to access it are transacted.
+template DataListing
+  with
+    provider    : Party
+      -- ^ The party offering the data for license. This party is the signatory.
+    operator    : Party
+      -- ^ The marketplace operator, an observer on all listings to facilitate discovery.
+    listingId   : Text
+      -- ^ A unique identifier for this listing, scoped to the provider.
+    name        : Text
+      -- ^ A human-readable name for the dataset.
+    description : Text
+      -- ^ A detailed description of the data contents and purpose.
+    schema      : Text
+      -- ^ A representation of the data schema, e.g., a stringified JSON Schema.
+    price       : Decimal
+      -- ^ The price to acquire a license for this data. Must be non-negative.
+    currency    : Text
+      -- ^ The currency of the price (e.g., "USD", "EUR", "CC").
+  where
+    signatory provider
+    observer operator
+
+    -- The price must not be negative.
+    ensure price >= 0.0
+
+    -- The combination of provider and listingId must be unique across the ledger.
+    key (provider, listingId) : (Party, Text)
+    maintainer key._1
+
+    -- | Allows the data provider to update the price of their listing.
+    -- This archives the current listing and creates a new one with the updated price.
+    choice UpdatePrice : ContractId DataListing
+      with
+        newPrice : Decimal
+          -- ^ The new price for the data license.
+      controller provider
+      do
+        ensure newPrice >= 0.0
+        create this with price = newPrice
+
+    -- | Allows the data provider to remove their listing from the marketplace.
+    -- This is a consuming choice that archives the contract.
+    choice ArchiveListing : ()
+      controller provider
+      do
+        archive self

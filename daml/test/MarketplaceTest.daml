@@ -1,0 +1,246 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module MarketplaceTest where
+
+import Daml.Script
+import DA.Assert
+
+import AccessToken
+import DataListing
+import RevenueShare
+import UsageAgreement
+
+-- | A collection of all tests for the data marketplace workflow.
+tests : Script ()
+tests = do
+  testFullLifecycle
+  testRejectPurchase
+  testUnauthorizedApproval
+  testUnauthorizedUsage
+
+-- | Tests the complete, successful "happy path" workflow:
+-- 1. A Data Provider lists a dataset for sale.
+-- 2. A Data Consumer requests to purchase a license.
+-- 3. The Provider approves the request.
+-- 4. A UsageAgreement, AccessToken, and RevenueShare contract are atomically created.
+-- 5. The Consumer logs usage via their AccessToken.
+-- 6. The Provider and Operator settle the revenue share.
+testFullLifecycle : Script ()
+testFullLifecycle = script do
+  -- === 1. Setup: Allocate parties for the scenario ===
+  operator <- allocatePartyWithHint "MarketplaceOperator" (PartyIdHint "operator")
+  provider <- allocatePartyWithHint "DataProvider" (PartyIdHint "dataprovider")
+  consumer <- allocatePartyWithHint "DataConsumer" (PartyIdHint "dataconsumer")
+
+  -- === 2. Listing: Provider creates a data listing ===
+  let
+    listingId = "financial-data-q1-2024"
+    price = 1000.0
+    royaltyFee = 0.05 -- 5%
+    description = "Quarterly financial performance data for S&P 500 companies."
+
+  listingCid <- submit provider do
+    createCmd DataListing with
+      provider
+      operator
+      listingId
+      description
+      price
+      royaltyFee
+
+  -- === 3. Purchase Request: Consumer requests to purchase a license ===
+  purchaseRequestCid <- submit consumer do
+    exerciseCmd listingCid RequestPurchase with consumer
+
+  -- === 4. Approval: Provider approves the purchase request ===
+  (agreementCid, tokenCid, revenueShareCid) <- submit provider do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+
+  -- === 5. Verification: Check that all resulting contracts were created correctly ===
+
+  -- Verify UsageAgreement
+  agreement <- fetch agreementCid
+  agreement.provider === provider
+  agreement.consumer === consumer
+  agreement.listingId === listingId
+  agreement.usageCount === 0
+  agreement.price === price
+  debug "UsageAgreement created correctly."
+
+  -- Verify AccessToken
+  token <- fetch tokenCid
+  token.provider === provider
+  token.consumer === consumer
+  token.listingId === listingId
+  debug "AccessToken created correctly."
+
+  -- Verify RevenueShare
+  revenueShare <- fetch revenueShareCid
+  revenueShare.provider === provider
+  revenueShare.operator === operator
+  revenueShare.listingId === listingId
+  revenueShare.totalRevenue === price
+  revenueShare.operatorShare === price * royaltyFee
+  revenueShare.providerShare === price * (1.0 - royaltyFee)
+  revenueShare.isSettled === False
+  debug "RevenueShare created correctly."
+
+  -- === 6. Usage: Consumer logs usage of the data via the AccessToken ===
+  -- The LogUsage choice on the AccessToken exercises the IncrementUsage choice on the UsageAgreement.
+  updatedAgreementCid <- submit consumer do
+    exerciseCmd tokenCid LogUsage with agreementCid
+
+  updatedAgreement <- fetch updatedAgreementCid
+  updatedAgreement.usageCount === 1
+  debug "First usage logged successfully."
+
+  -- Log usage a second time to ensure state updates correctly.
+  updatedAgreementCid2 <- submit consumer do
+    exerciseCmd tokenCid LogUsage with agreementCid = updatedAgreementCid
+
+  updatedAgreement2 <- fetch updatedAgreementCid2
+  updatedAgreement2.usageCount === 2
+  debug "Second usage logged successfully."
+
+  -- === 7. Settlement: Provider and Operator settle the revenue share ===
+  -- This requires authorization from both parties.
+  settledRevenueShareCid <- submitMulti [provider, operator] do
+    exerciseCmd revenueShareCid Settle
+
+  settledRevenueShare <- fetch settledRevenueShareCid
+  settledRevenueShare.isSettled === True
+  debug "Revenue share settled successfully."
+
+  pure ()
+
+-- | Tests the scenario where a Data Provider rejects a purchase request.
+-- Verifies that the request contract is archived and no other contracts are created.
+testRejectPurchase : Script ()
+testRejectPurchase = script do
+  -- Setup
+  operator <- allocatePartyWithHint "OperatorReject" (PartyIdHint "operator_reject")
+  provider <- allocatePartyWithHint "ProviderReject" (PartyIdHint "provider_reject")
+  consumer <- allocatePartyWithHint "ConsumerReject" (PartyIdHint "consumer_reject")
+
+  -- Listing
+  listingCid <- submit provider do
+    createCmd DataListing with
+      provider
+      operator
+      listingId = "test-data-for-rejection"
+      description = "Data for rejection test"
+      price = 50.0
+      royaltyFee = 0.1
+
+  -- Purchase Request
+  purchaseRequestCid <- submit consumer do
+    exerciseCmd listingCid RequestPurchase with consumer
+  debug "Purchase request created for rejection test."
+
+  -- Rejection
+  submit provider do
+    exerciseCmd purchaseRequestCid RejectPurchase
+  debug "Provider rejected the purchase request."
+
+  -- Verification
+  -- Ensure the request is archived and no other contracts were created.
+  requestIsArchived <- fmap isNone (queryContractId provider purchaseRequestCid)
+  assert requestIsArchived
+
+  agreements <- query @UsageAgreement provider
+  tokens <- query @AccessToken provider
+  shares <- query @RevenueShare provider
+
+  length agreements === 0
+  length tokens === 0
+  length shares === 0
+  debug "Verified that no contracts were created after rejection."
+
+  pure ()
+
+-- | Tests that only the designated Data Provider can approve a purchase request.
+-- Attempts to approve by the consumer, operator, and a malicious third party must fail.
+testUnauthorizedApproval : Script ()
+testUnauthorizedApproval = script do
+  -- Setup
+  operator <- allocatePartyWithHint "OperatorAuth" (PartyIdHint "operator_auth")
+  provider <- allocatePartyWithHint "ProviderAuth" (PartyIdHint "provider_auth")
+  consumer <- allocatePartyWithHint "ConsumerAuth" (PartyIdHint "consumer_auth")
+  maliciousParty <- allocatePartyWithHint "Hacker" (PartyIdHint "hacker")
+
+  -- Listing
+  listingCid <- submit provider do
+    createCmd DataListing with
+      provider
+      operator
+      listingId = "sensitive-data"
+      description = "Data for unauthorized approval test"
+      price = 999.0
+      royaltyFee = 0.02
+
+  -- Purchase Request
+  purchaseRequestCid <- submit consumer do
+    exerciseCmd listingCid RequestPurchase with consumer
+  debug "Purchase request created for auth test."
+
+  -- Attempted Unauthorized Approvals
+  debug "Attempting unauthorized approvals..."
+  submitMustFail consumer do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+  debug "Consumer approval failed as expected."
+
+  submitMustFail operator do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+  debug "Operator approval failed as expected."
+
+  submitMustFail maliciousParty do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+  debug "Malicious party approval failed as expected."
+
+  -- Successful Approval (by the correct party)
+  -- This confirms the contract is still alive and was not affected by the failed attempts.
+  _ <- submit provider do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+  debug "Provider successfully approved the request after failed attempts."
+
+  pure ()
+
+-- | Tests that only the legitimate consumer can use their access token.
+testUnauthorizedUsage : Script ()
+testUnauthorizedUsage = script do
+  -- Setup
+  operator <- allocatePartyWithHint "OperatorUsage" (PartyIdHint "operator_usage")
+  provider <- allocatePartyWithHint "ProviderUsage" (PartyIdHint "provider_usage")
+  consumer <- allocatePartyWithHint "ConsumerUsage" (PartyIdHint "consumer_usage")
+  otherConsumer <- allocatePartyWithHint "OtherConsumer" (PartyIdHint "other_consumer")
+
+  -- Go through the happy path to get an AccessToken
+  listingCid <- submit provider do
+    createCmd DataListing with provider, operator, listingId = "usage-test", description = "", price = 1.0, royaltyFee = 0.1
+  purchaseRequestCid <- submit consumer do
+    exerciseCmd listingCid RequestPurchase with consumer
+  (agreementCid, tokenCid, _) <- submit provider do
+    exerciseCmd purchaseRequestCid ApprovePurchase
+  debug "AccessToken and UsageAgreement created for usage auth test."
+
+  -- Attempt Unauthorized Usage
+  debug "Attempting unauthorized usage..."
+  submitMustFail provider do
+    exerciseCmd tokenCid LogUsage with agreementCid
+  debug "Provider usage failed as expected."
+
+  submitMustFail operator do
+    exerciseCmd tokenCid LogUsage with agreementCid
+  debug "Operator usage failed as expected."
+
+  submitMustFail otherConsumer do
+    exerciseCmd tokenCid LogUsage with agreementCid
+  debug "Other consumer usage failed as expected."
+
+  -- Successful Usage
+  _ <- submit consumer do
+    exerciseCmd tokenCid LogUsage with agreementCid
+  debug "Legitimate consumer usage succeeded."
+
+  pure ()

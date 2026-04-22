@@ -1,0 +1,82 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DataMarketplace.RevenueShare where
+
+import DA.Assert ((===))
+import DA.Foldable (sum)
+import DA.Text (Text, show)
+
+import DataMarketplace.DataListing (DataListing)
+import DataMarketplace.UsageAgreement (UsageAgreement)
+
+-- | Defines a single party's share of the revenue.
+data RevenueSplit = RevenueSplit with
+  recipient : Party
+    -- ^ The party receiving the funds.
+  amount : Decimal
+    -- ^ The amount to be received.
+  deriving (Eq, Show)
+
+-- | Represents the agreed-upon split of revenue from a data license sale.
+-- This contract is created after a `UsageAgreement` is finalized and payment is confirmed.
+-- It tracks the amounts owed to the data provider and any other stakeholders (e.g., the marketplace operator),
+-- providing a clear, auditable record of the financial settlement associated with a data transaction.
+template RevenueShare
+  with
+    marketplaceOperator : Party
+      -- ^ The party operating the marketplace, often a recipient in the split.
+    dataProvider : Party
+      -- ^ The primary data provider who owns the licensed data.
+    payer : Party
+      -- ^ The party who consumed the data and made the payment.
+    listingCid : ContractId DataListing
+      -- ^ Reference to the original data listing for audit purposes.
+    usageAgreementCid : ContractId UsageAgreement
+      -- ^ Unique reference to the agreement that generated this revenue.
+    totalAmount : Decimal
+      -- ^ The total amount paid by the consumer.
+    currency : Text
+      -- ^ The currency of the transaction (e.g., "USD", "EUR").
+    splits : [RevenueSplit]
+      -- ^ A detailed breakdown of how the `totalAmount` is to be split among recipients.
+    settled : Bool
+      -- ^ A flag indicating whether the revenue has been distributed.
+
+  where
+    signatory marketplaceOperator, dataProvider
+    observer payer
+
+    ensure
+      let
+        calculatedTotal = sum (map (.amount) splits)
+        allAmountsPositive = all (\s -> s.amount >= 0.0) splits
+      in
+        "Sum of splits (" <> show calculatedTotal <> ") must equal total amount (" <> show totalAmount <> ")"
+          `assert` (totalAmount == calculatedTotal)
+        && "Total amount must be positive" `assert` (totalAmount > 0.0)
+        && "All split amounts must be non-negative" `assert` allAmountsPositive
+        && "Revenue splits cannot be empty" `assert` (not $ null splits)
+
+    key (marketplaceOperator, dataProvider, usageAgreementCid) : (Party, Party, ContractId UsageAgreement)
+    maintainer key._1, key._2
+
+    -- | Marks the revenue share as settled.
+    -- In a production system, this choice would be part of a larger atomic workflow
+    -- that includes the transfer of tokenized assets (e.g., via a DVP process)
+    -- to the recipients defined in `splits`. This action confirms the on-ledger
+    -- state reflects the completion of that settlement.
+    choice Settle : ContractId RevenueShare
+      controller marketplaceOperator
+      do
+        assertMsg "Revenue share has already been settled." (not settled)
+        create this with settled = True
+
+    -- | Archives the contract after it has been settled and is no longer needed
+    -- for active processing, freeing up space on the Active Contract Set (ACS).
+    -- This is a standard lifecycle management step.
+    choice Archive : ()
+      controller marketplaceOperator, dataProvider
+      do
+        assertMsg "Revenue share must be settled before it can be archived." settled
+        pure ()

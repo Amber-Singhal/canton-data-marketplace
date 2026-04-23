@@ -1,76 +1,178 @@
--- | This module defines the AccessToken template, which represents a consumer's
--- licensed right to access a specific dataset from a provider. It is the on-ledger
--- evidence of a completed data licensing transaction.
-module DataMarketplace.AccessToken where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
-import DA.Time (Time)
-import DataMarketplace.DataListing (DataListing)
+module Marketplace.AccessToken where
 
--- | Represents a granted license for a consumer to access a specific dataset.
--- This token is created after a successful licensing agreement and payment.
--- It serves as the on-ledger proof of right-to-access for the consumer.
--- Data providers can query for these tokens to verify access requests from consumers.
+import DA.Time (Time, addRelTime, days)
+import Daml.Script
+
+-- | Represents a time-limited, usage-capped right for a consumer to access a
+-- | specific dataset provided by a data provider. This token is typically created
+-- | as the result of a `LicenseAgreement` being accepted. The actual data access
+-- | happens off-ledger, and this token is used to authorize that access.
 template AccessToken
   with
-    provider     : Party
+    provider   : Party
       -- ^ The party providing the data and issuing the token.
-    consumer     : Party
-      -- ^ The party who has licensed the data and holds the token.
-    operator     : Party
-      -- ^ The operator of the marketplace, who observes the token issuance.
-    listingCid   : ContractId DataListing
-      -- ^ The contract ID of the original data listing this token pertains to.
-    listingId    : Text
-      -- ^ A unique identifier for the data listing, for easy reference.
-    datasetName  : Text
-      -- ^ The name of the dataset.
-    issuedAt     : Time
-      -- ^ The timestamp when the token was issued.
-    expiresAt    : Optional Time
-      -- ^ The timestamp when the access rights expire. If None, the license is perpetual.
-    usageRights  : Text
-      -- ^ A description of the permitted usage of the data (e.g., "Internal analytics only").
-
+    consumer   : Party
+      -- ^ The party who holds the token and is granted access to the data.
+    operator   : Party
+      -- ^ The marketplace operator, an observer on the token's lifecycle.
+    datasetId  : Text
+      -- ^ A unique identifier for the dataset this token grants access to.
+    licenseId  : Text
+      -- ^ The identifier of the license agreement under which this token was issued.
+    expiresAt  : Time
+      -- ^ The timestamp at which this token becomes invalid.
+    usageLimit : Int
+      -- ^ The maximum number of times this token can be used.
+    usageCount : Int
+      -- ^ The number of times this token has been used so far.
+    lastUsedAt : Optional Time
+      -- ^ The timestamp of the last successful usage.
   where
     signatory provider
     observer consumer, operator
 
-    key (provider, consumer, listingId) : (Party, Party, Text)
+    key (provider, consumer, datasetId) : (Party, Party, Text)
     maintainer key._1
 
-    -- | Allows the consumer or provider to verify the token is not expired (if an expiry is set).
-    -- This is a non-consuming choice and will fail if the token has expired.
-    nonconsuming choice CheckStatus : ()
-      controller consumer, provider
-      do
-        -- If an expiry time is set, check that the current ledger time is before it.
-        case expiresAt of
-          Some expiry -> do
-            now <- getTime
-            assertMsg ("Access token for listing '" <> listingId <> "' expired at " <> show expiry) (now < expiry)
-          None ->
-            -- No expiry, so the token is considered perpetually valid.
-            return ()
+    ensure
+      usageCount >= 0 &&
+      usageLimit > 0 &&
+      usageCount <= usageLimit
 
-    -- | Allows the provider to revoke the access token, for example, due to a
-    -- breach of the terms of service. This archives the token, effectively
-    -- terminating the consumer's access rights.
-    choice Revoke : ()
-      with
-        reason: Text
-          -- ^ The reason for revoking the access token, for audit purposes.
-      controller provider
-      do
-        -- The act of exercising this consuming choice archives the contract.
-        -- Future logic could involve creating a 'RevocationReceipt' contract.
-        return ()
-
-    -- | Allows the consumer to voluntarily surrender their access rights before expiry.
-    -- This might be used if they no longer need the data or are decommissioning
-    -- a project that used it.
-    choice Surrender : ()
+    -- | The consumer exercises this choice to signify one-time use of the data
+    -- | access right. This would typically be called by an off-ledger API gateway
+    -- | that first validates the token on the ledger before granting data access.
+    choice UseToken : ContractId AccessToken
       controller consumer
       do
-        -- The act of exercising this consuming choice archives the contract.
-        -- Future logic could involve creating a 'SurrenderReceipt' contract.
-        return ()
+        now <- getTime
+        assertMsg "Access token has expired" (now <= self.expiresAt)
+        assertMsg "Usage limit has been reached" (self.usageCount < self.usageLimit)
+
+        create this with
+          usageCount = self.usageCount + 1
+          lastUsedAt = Some now
+
+    -- | The provider can revoke the token at any time, for example if the
+    -- | consumer violates the terms of the license agreement.
+    choice RevokeToken : ()
+      controller provider
+      do
+        pure ()
+
+-- | Test suite for the AccessToken template and its choices.
+test_AccessToken : Script ()
+test_AccessToken = script do
+  provider <- allocateParty "Provider"
+  consumer <- allocateParty "Consumer"
+  operator <- allocateParty "Operator"
+
+  let datasetId = "dataset-test-001"
+  let licenseId = "license-test-001"
+
+  now <- getTime
+  let expires = addRelTime now (days 30)
+
+  -- Test 1: Successful token creation and usage
+  test_successfulUsage : Script ()
+  test_successfulUsage = do
+    accessTokenCid <- submit provider do
+      create AccessToken with
+        provider
+        consumer
+        operator
+        datasetId
+        licenseId
+        expiresAt = expires
+        usageLimit = 10
+        usageCount = 0
+        lastUsedAt = None
+
+    -- Consumer uses the token
+    updatedAccessTokenCid <- submit consumer do
+      exercise accessTokenCid UseToken
+
+    -- Verify usage count has incremented
+    updatedAccessToken <- fetch updatedAccessTokenCid
+    updatedAccessToken.usageCount === 1
+    assert (isSome updatedAccessToken.lastUsedAt)
+
+    -- Use it again
+    finalAccessTokenCid <- submit consumer do
+      exercise updatedAccessTokenCid UseToken
+    finalAccessToken <- fetch finalAccessTokenCid
+    finalAccessToken.usageCount === 2
+
+  -- Test 2: Attempt to use an expired token
+  test_expiredTokenUsage : Script ()
+  test_expiredTokenUsage = do
+    let expiredTime = addRelTime now (days (-1))
+    expiredTokenCid <- submit provider do
+      create AccessToken with
+        provider
+        consumer
+        operator
+        datasetId = "expired-dataset"
+        licenseId
+        expiresAt = expiredTime
+        usageLimit = 10
+        usageCount = 0
+        lastUsedAt = None
+
+    submitMustFail consumer do
+      exercise expiredTokenCid UseToken
+
+  -- Test 3: Attempt to exceed the usage limit
+  test_usageLimitExceeded : Script ()
+  test_usageLimitExceeded = do
+    limitedTokenCid <- submit provider do
+      create AccessToken with
+        provider
+        consumer
+        operator
+        datasetId = "limited-dataset"
+        licenseId
+        expiresAt = expires
+        usageLimit = 1
+        usageCount = 0
+        lastUsedAt = None
+
+    -- Use the token once (successfully)
+    usedTokenCid <- submit consumer do
+      exercise limitedTokenCid UseToken
+    usedToken <- fetch usedTokenCid
+    usedToken.usageCount === 1
+
+    -- Attempt to use it again (must fail)
+    submitMustFail consumer do
+      exercise usedTokenCid UseToken
+
+  -- Test 4: Provider successfully revokes a token
+  test_successfulRevocation : Script ()
+  test_successfulRevocation = do
+    tokenToRevokeCid <- submit provider do
+      create AccessToken with
+        provider
+        consumer
+        operator
+        datasetId = "revoked-dataset"
+        licenseId
+        expiresAt = expires
+        usageLimit = 100
+        usageCount = 0
+        lastUsedAt = None
+
+    submit provider do
+      exercise tokenToRevokeCid RevokeToken
+
+    -- Verify it is archived by trying to fetch it (which will fail)
+    fetch tokenToRevokeCid `shouldFail` pure()
+
+  -- Run all tests
+  test_successfulUsage
+  test_expiredTokenUsage
+  test_usageLimitExceeded
+  test_successfulRevocation
